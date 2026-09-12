@@ -1,3 +1,8 @@
+## Unreleased
+
+- Remove unreported observable gauge series and release their cardinality budget on collection.
+- Serialise collections per provider and reject same-thread recursive collection.
+
 # Changelog for hs-opentelemetry-sdk
 
 ## Unreleased

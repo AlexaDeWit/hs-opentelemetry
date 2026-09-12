@@ -1,18 +1,11 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE StrictData #-}
 
-{- | SDK 'OpenTelemetry.Metric.Core.MeterProvider' with in-process aggregation (specification/metrics/sdk.md).
-
- Synchronous: cumulative or delta sums, explicit or exponential histograms, last-value gauges;
- exemplars (optional trace context); cardinality limits; views (drop, aggregation, attribute keys).
- Observable callbacks run in registration order. Periodic export: "OpenTelemetry.MetricReader".
--}
+-- | SDK metric aggregation with views, cardinality limits and optional exemplars.
 module OpenTelemetry.MeterProvider (
   SdkMeterProviderOptions (..),
   defaultSdkMeterProviderOptions,
@@ -27,9 +20,12 @@ module OpenTelemetry.MeterProvider (
   deltaTemporality,
 ) where
 
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Exception (Exception, bracket_, throwIO)
+import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
-import Data.Foldable (toList)
 import qualified Data.HashMap.Strict as H
 import qualified Data.HashSet as HS
 import Data.Hashable (Hashable)
@@ -88,6 +84,7 @@ import OpenTelemetry.Trace.Id (spanIdBytes, traceIdBytes)
 import System.Clock (Clock (Realtime), getTime, toNanoSecs)
 
 
+-- | Exemplar sampling and storage limits.
 data SdkMeterExemplarOptions = SdkMeterExemplarOptions
   { exemplarFilter :: !MetricsExemplarFilter
   -- ^ Spec default is TraceBased. Configured via OTEL_METRICS_EXEMPLAR_FILTER or explicit option.
@@ -95,6 +92,7 @@ data SdkMeterExemplarOptions = SdkMeterExemplarOptions
   }
 
 
+-- | Use trace-based sampling and one exemplar per reservoir.
 defaultSdkMeterExemplarOptions :: SdkMeterExemplarOptions
 defaultSdkMeterExemplarOptions =
   SdkMeterExemplarOptions
@@ -103,20 +101,24 @@ defaultSdkMeterExemplarOptions =
     }
 
 
+-- | An exporter and its instrument temporality selection.
 data MetricReader = MetricReader
   { metricReaderExporter :: !MetricExporter
   , metricReaderTemporalityFor :: !(InstrumentKind -> AggregationTemporality)
   }
 
 
+-- | Select cumulative aggregation for every instrument.
 cumulativeTemporality :: InstrumentKind -> AggregationTemporality
 cumulativeTemporality _ = AggregationCumulative
 
 
+-- | Select delta aggregation for every instrument.
 deltaTemporality :: InstrumentKind -> AggregationTemporality
 deltaTemporality _ = AggregationDelta
 
 
+-- | Provider aggregation, views and export settings.
 data SdkMeterProviderOptions = SdkMeterProviderOptions
   { cardinalityLimit :: !Int
   , aggregationTemporality :: !AggregationTemporality
@@ -126,6 +128,7 @@ data SdkMeterProviderOptions = SdkMeterProviderOptions
   }
 
 
+-- | Use cumulative aggregation with a cardinality limit of 2000.
 defaultSdkMeterProviderOptions :: SdkMeterProviderOptions
 defaultSdkMeterProviderOptions =
   SdkMeterProviderOptions
@@ -143,6 +146,7 @@ data SdkMeterStorageState = SdkMeterStorageState
   }
 
 
+-- | Empty aggregates and cardinality accounting.
 emptyStorageState :: SdkMeterStorageState
 emptyStorageState =
   SdkMeterStorageState
@@ -151,9 +155,12 @@ emptyStorageState =
     }
 
 
+-- | Provider state returned by 'createMeterProvider'.
 data SdkMeterEnv = SdkMeterEnv
   { sdkMeterStorage :: !(IORef SdkMeterStorageState)
   , sdkMeterCollectCallbacks :: !(IORef (Seq (IO ())))
+  , sdkMeterCollectionLock :: !(MVar ())
+  , sdkMeterCollectionOwner :: !(IORef (Maybe ThreadId))
   , sdkMeterResource :: !MaterializedResources
   , sdkMeterShutdown :: !(IORef Bool)
   , sdkMeterCardinalityLimit :: !Int
@@ -260,10 +267,7 @@ bumpSeriesCount dims sc =
 
 bucketIndex :: Vector Double -> Double -> Int
 bucketIndex bounds v =
-  let n = V.length bounds
-  in case V.findIndex (\b -> v <= b) bounds of
-       Just i -> i
-       Nothing -> n
+  fromMaybe (V.length bounds) (V.findIndex (v <=) bounds)
 
 
 emptyHist :: Vector Double -> HistCell
@@ -302,17 +306,14 @@ positiveBucketIndex x sc =
 mergeExpHist :: ExpHistCell -> Double -> ExpHistCell
 mergeExpHist ehc v =
   let sc = ehcScale ehc
-      upd =
-        if v == 0
-          then ehc {ehcZeroCount = ehcZeroCount ehc + 1}
-          else
-            if v > 0
-              then
-                let idx = positiveBucketIndex v sc
-                in ehc {ehcPositive = IM.insertWith (+) idx 1 (ehcPositive ehc)}
-              else
-                let idx = positiveBucketIndex (abs v) sc
-                in ehc {ehcNegative = IM.insertWith (+) idx 1 (ehcNegative ehc)}
+      upd
+        | v == 0 = ehc {ehcZeroCount = ehcZeroCount ehc + 1}
+        | v > 0 =
+            let idx = positiveBucketIndex v sc
+            in ehc {ehcPositive = IM.insertWith (+) idx 1 (ehcPositive ehc)}
+        | otherwise =
+            let idx = positiveBucketIndex (abs v) sc
+            in ehc {ehcNegative = IM.insertWith (+) idx 1 (ehcNegative ehc)}
       sm = ehcSum ehc + v
       ct = ehcCount ehc + 1
   in upd
@@ -414,9 +415,7 @@ shouldDropInstrument views kind name =
     _ -> False
 
 
-{- | Resolve attribute key filtering. Spec: view attribute_keys take precedence;
-if absent, fall back to advisory Attributes parameter; if absent, keep all.
--}
+-- | View attribute keys take precedence over advisory keys.
 exportKeysFor :: [View] -> InstrumentKind -> Text -> AdvisoryParameters -> Maybe [Text]
 exportKeysFor views kind name adv =
   case findMatchingView views kind name of
@@ -1106,16 +1105,18 @@ mkMeter env scope =
               }
 
 
-{- | Build export batches from current in-memory aggregates (invoke observable callbacks first).
-
-Each batch has exactly the resource given at 'createMeterProvider'. If you run multiple
-meter providers, do not merge their exports into one 'ResourceMetricsExport' — keep one
-top-level entry per resource when forwarding to an exporter.
--}
+-- | Collect one resource's observations. Callbacks must not wait for another collection. Same-thread recursion throws an exception.
 collectResourceMetrics :: (MonadIO m) => SdkMeterEnv -> m [ResourceMetricsExport]
-collectResourceMetrics env = liftIO $ do
+collectResourceMetrics env = liftIO $ withCollection env $ do
+  atomicModifyIORef' (sdkMeterStorage env) $ \st ->
+    ( st
+        { storageCells = H.filterWithKey (\(dims, _) _ -> dimKind dims /= KindAsyncGauge) (storageCells st)
+        , seriesCountByDims = H.filterWithKey (\dims _ -> dimKind dims /= KindAsyncGauge) (seriesCountByDims st)
+        }
+    , ()
+    )
   cbs <- readIORef (sdkMeterCollectCallbacks env)
-  mapM_ id (toList cbs)
+  sequence_ cbs
   t <- nowNanos
   let temp = sdkMeterAggregationTemporality env
       startT = sdkMeterStartTimeNanos env
@@ -1128,6 +1129,23 @@ collectResourceMetrics env = liftIO $ do
       readIORef (sdkMeterStorage env)
   let rme = buildResourceExport (sdkMeterResource env) startT t temp (storageCells st)
   pure [rme]
+
+
+data RecursiveMetricCollection = RecursiveMetricCollection
+  deriving stock (Show)
+  deriving anyclass (Exception)
+
+
+withCollection :: SdkMeterEnv -> IO a -> IO a
+withCollection env action = do
+  thread <- myThreadId
+  owner <- readIORef (sdkMeterCollectionOwner env)
+  when (owner == Just thread) $ throwIO RecursiveMetricCollection
+  withMVar (sdkMeterCollectionLock env) $ \_ ->
+    bracket_
+      (writeIORef (sdkMeterCollectionOwner env) (Just thread))
+      (writeIORef (sdkMeterCollectionOwner env) Nothing)
+      action
 
 
 buildResourceExport
@@ -1147,7 +1165,7 @@ buildResourceExport res startT t temp m =
           )
           H.empty
           m
-      scopes = V.fromList $ fmap (toScope startT t temp) $ H.elems groups
+      scopes = V.fromList $ toScope startT t temp <$> H.elems groups
   in ResourceMetricsExport res scopes
 
 
@@ -1161,7 +1179,7 @@ toScope startT t temp series =
 
 
 applyDimAttrs :: InstrumentDims -> Attributes -> Attributes
-applyDimAttrs dims attrs = filterAttributesByKeys (dimExportAttributeKeys dims) attrs
+applyDimAttrs dims = filterAttributesByKeys (dimExportAttributeKeys dims)
 
 
 buildMetricExports
@@ -1276,6 +1294,8 @@ createMeterProvider res opts = do
   st <- newIORef emptyStorageState
   cbs <- newIORef Seq.empty
   sd <- newIORef False
+  collectionLock <- newMVar ()
+  collectionOwner <- newIORef Nothing
   startT <- nowNanos
   envFilter <- lookupMetricsExemplarFilter
   let lim = cardinalityLimit opts
@@ -1289,6 +1309,8 @@ createMeterProvider res opts = do
         SdkMeterEnv
           { sdkMeterStorage = st
           , sdkMeterCollectCallbacks = cbs
+          , sdkMeterCollectionLock = collectionLock
+          , sdkMeterCollectionOwner = collectionOwner
           , sdkMeterResource = res
           , sdkMeterShutdown = sd
           , sdkMeterCardinalityLimit = lim
