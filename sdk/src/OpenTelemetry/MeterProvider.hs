@@ -143,6 +143,7 @@ defaultSdkMeterProviderOptions =
 data SdkMeterStorageState = SdkMeterStorageState
   { storageCells :: !(H.HashMap DimKey Cell)
   , seriesCountByDims :: !(H.HashMap InstrumentDims Int)
+  , collectionState :: !(Maybe CollectionState)
   }
 
 
@@ -152,6 +153,7 @@ emptyStorageState =
   SdkMeterStorageState
     { storageCells = H.empty
     , seriesCountByDims = H.empty
+    , collectionState = Nothing
     }
 
 
@@ -159,8 +161,6 @@ emptyStorageState =
 data SdkMeterEnv = SdkMeterEnv
   { sdkMeterStorage :: !(IORef SdkMeterStorageState)
   , sdkMeterCollectCallbacks :: !(IORef (Seq (IO ())))
-  , sdkMeterCollectionLock :: !(MVar ())
-  , sdkMeterCollectionOwner :: !(IORef (Maybe ThreadId))
   , sdkMeterResource :: !MaterializedResources
   , sdkMeterShutdown :: !(IORef Bool)
   , sdkMeterCardinalityLimit :: !Int
@@ -541,7 +541,7 @@ addSumInt delta isMonotonic mExVal k ref lim exOpts = do
            isNew = not (H.member effectiveK m)
            m' = H.insert effectiveK newCell m
            sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-       in (SdkMeterStorageState m' sc', ())
+       in (st {storageCells = m', seriesCountByDims = sc'}, ())
 
 
 addSumDbl
@@ -582,7 +582,7 @@ addSumDbl delta isMonotonic mExVal k ref lim exOpts = do
            isNew = not (H.member effectiveK m)
            m' = H.insert effectiveK newCell m
            sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-       in (SdkMeterStorageState m' sc', ())
+       in (st {storageCells = m', seriesCountByDims = sc'}, ())
 
 
 addEither :: Either Int64 Double -> Either Int64 Double -> Either Int64 Double
@@ -636,7 +636,7 @@ recordHist bounds v mExVal k ref lim exOpts = do
                isNew = not (H.member effectiveK m)
                m' = H.insert effectiveK newCell m
                sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-           in (SdkMeterStorageState m' sc', ())
+           in (st {storageCells = m', seriesCountByDims = sc'}, ())
 
 
 recordExpHist
@@ -668,7 +668,7 @@ recordExpHist sc v mExVal k ref lim exOpts = do
                isNew = not (H.member effectiveK m)
                m' = H.insert effectiveK newCell m
                sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-           in (SdkMeterStorageState m' sc', ())
+           in (st {storageCells = m', seriesCountByDims = sc'}, ())
 
 
 recordGauge
@@ -715,7 +715,7 @@ recordGauge val t mExVal k ref lim exOpts = do
            isNew = not (H.member effectiveK m)
            m' = H.insert effectiveK newCell m
            sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-       in (SdkMeterStorageState m' sc', ())
+       in (st {storageCells = m', seriesCountByDims = sc'}, ())
 
 
 resetCellForDelta :: Cell -> Cell
@@ -738,10 +738,7 @@ resetCellForDelta = \case
 
 applyDeltaReset :: SdkMeterStorageState -> SdkMeterStorageState
 applyDeltaReset st =
-  SdkMeterStorageState
-    { storageCells = H.map resetCellForDelta (storageCells st)
-    , seriesCountByDims = seriesCountByDims st
-    }
+  st {storageCells = H.map resetCellForDelta (storageCells st)}
 
 
 mkMeter :: SdkMeterEnv -> InstrumentationLibrary -> Meter
@@ -1138,14 +1135,31 @@ data RecursiveMetricCollection = RecursiveMetricCollection
 
 withCollection :: SdkMeterEnv -> IO a -> IO a
 withCollection env action = do
+  CollectionState lock ownerRef <- getCollectionState (sdkMeterStorage env)
   thread <- myThreadId
-  owner <- readIORef (sdkMeterCollectionOwner env)
+  owner <- readIORef ownerRef
   when (owner == Just thread) $ throwIO RecursiveMetricCollection
-  withMVar (sdkMeterCollectionLock env) $ \_ ->
+  withMVar lock $ \_ ->
     bracket_
-      (writeIORef (sdkMeterCollectionOwner env) (Just thread))
-      (writeIORef (sdkMeterCollectionOwner env) Nothing)
+      (writeIORef ownerRef (Just thread))
+      (writeIORef ownerRef Nothing)
       action
+
+
+data CollectionState = CollectionState !(MVar ()) !(IORef (Maybe ThreadId))
+
+
+getCollectionState :: IORef SdkMeterStorageState -> IO CollectionState
+getCollectionState storage = do
+  current <- collectionState <$> readIORef storage
+  case current of
+    Just state -> pure state
+    Nothing -> do
+      candidate <- CollectionState <$> newMVar () <*> newIORef Nothing
+      atomicModifyIORef' storage $ \st ->
+        case collectionState st of
+          Just state -> (st, state)
+          Nothing -> (st {collectionState = Just candidate}, candidate)
 
 
 buildResourceExport
@@ -1294,8 +1308,6 @@ createMeterProvider res opts = do
   st <- newIORef emptyStorageState
   cbs <- newIORef Seq.empty
   sd <- newIORef False
-  collectionLock <- newMVar ()
-  collectionOwner <- newIORef Nothing
   startT <- nowNanos
   envFilter <- lookupMetricsExemplarFilter
   let lim = cardinalityLimit opts
@@ -1309,8 +1321,6 @@ createMeterProvider res opts = do
         SdkMeterEnv
           { sdkMeterStorage = st
           , sdkMeterCollectCallbacks = cbs
-          , sdkMeterCollectionLock = collectionLock
-          , sdkMeterCollectionOwner = collectionOwner
           , sdkMeterResource = res
           , sdkMeterShutdown = sd
           , sdkMeterCardinalityLimit = lim
@@ -1333,8 +1343,10 @@ createMeterProvider res opts = do
                   _ <- metricExporterExport ex (V.fromList batches)
                   metricExporterShutdown ex
                 Nothing -> pure ShutdownSuccess
-              writeIORef st emptyStorageState
-              writeIORef cbs Seq.empty
+              withCollection env $ do
+                atomicModifyIORef' st $ \current ->
+                  (current {storageCells = H.empty, seriesCountByDims = H.empty}, ())
+                writeIORef cbs Seq.empty
               pure shutdownRes
           , meterProviderForceFlush = \_timeoutMicros -> do
               batches <- collectResourceMetrics env

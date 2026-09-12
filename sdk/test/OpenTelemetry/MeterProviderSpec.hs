@@ -19,12 +19,13 @@ import OpenTelemetry.Exporter.Metric (
   GaugeDataPoint (..),
   HistogramDataPoint (..),
   MetricExport (..),
+  MetricExporter (..),
   NumberValue (..),
   ResourceMetricsExport (..),
   ScopeMetricsExport (..),
   SumDataPoint (..),
  )
-import OpenTelemetry.Internal.Common.Types (FlushResult (..), InstrumentationLibrary (..), ShutdownResult (..))
+import OpenTelemetry.Internal.Common.Types (ExportResult (..), FlushResult (..), InstrumentationLibrary (..), ShutdownResult (..))
 import OpenTelemetry.MeterProvider
 import OpenTelemetry.Metric.Core (
   AdvisoryParameters (..),
@@ -39,6 +40,7 @@ import OpenTelemetry.Metric.Core (
   defaultAdvisoryParameters,
   forceFlushMeterProvider,
   getMeter,
+  noopMeterProvider,
   shutdownMeterProvider,
  )
 import OpenTelemetry.Metric.View (View (..), ViewAggregation (..), ViewSelector (..))
@@ -79,6 +81,33 @@ firstMetric _ = error "expected single ResourceMetricsExport"
 -- | Regression tests for SDK metric aggregation.
 spec :: Spec
 spec = do
+  it "collects a disabled SDK environment with the released public record fields" $ do
+    storage <- newIORef emptyStorageState
+    callbacks <- newIORef mempty
+    shutdown <- newIORef True
+    let env =
+          SdkMeterEnv
+            { sdkMeterStorage = storage
+            , sdkMeterCollectCallbacks = callbacks
+            , sdkMeterResource = emptyMaterializedResources
+            , sdkMeterShutdown = shutdown
+            , sdkMeterCardinalityLimit = 0
+            , sdkMeterAggregationTemporality = AggregationCumulative
+            , sdkMeterViews = []
+            , sdkMeterExemplarOptions = defaultSdkMeterExemplarOptions
+            , sdkMeterStartTimeNanos = 0
+            }
+        collectEmpty = do
+          batches <- collectResourceMetrics env
+          map resourceMetricsScopes batches `shouldBe` [V.empty]
+    completed <- timeout 2000000 $
+      withAsync collectEmpty $ \first -> do
+        collectEmpty
+        wait first
+        forceFlushMeterProvider noopMeterProvider Nothing `shouldReturn` FlushSuccess
+        shutdownMeterProvider noopMeterProvider Nothing `shouldReturn` ShutdownSuccess
+        collectEmpty
+    completed `shouldBe` Just ()
   observableGaugeSpec "Int64" IntNumber $ \m callbacks ->
     void $ meterCreateObservableGaugeInt64 m "observed" Nothing Nothing defaultAdvisoryParameters callbacks
   observableGaugeSpec "Double" DoubleNumber $ \m callbacks ->
@@ -550,32 +579,86 @@ observableGaugeSpec numericType number create = describe ("observable gauge " <>
       points <- gaugePoints <$> collectResourceMetrics env
       map gaugeDataPointValue points `shouldMatchList` [number 1, number 2]
 
-  it "serialises overlapping collections into complete snapshots" $ do
-    (provider, env) <- createMeterProvider emptyMaterializedResources defaultSdkMeterProviderOptions
-    m <- getMeter provider scope
-    entered <- newEmptyMVar
-    resume <- newEmptyMVar
-    secondStarted <- newEmptyMVar
+  forM_ [AggregationCumulative, AggregationDelta] $ \temporality ->
+    it ("serialises overlapping collections into complete snapshots with " <> show temporality) $ do
+      (provider, env) <- createMeterProvider emptyMaterializedResources defaultSdkMeterProviderOptions {aggregationTemporality = temporality}
+      m <- getMeter provider scope
+      intCounter <- meterCreateCounterInt64 m "retained.int" Nothing Nothing defaultAdvisoryParameters
+      doubleCounter <- meterCreateCounterDouble m "retained.double" Nothing Nothing defaultAdvisoryParameters
+      histogram <- meterCreateHistogram m "retained.histogram" Nothing Nothing defaultAdvisoryParameters
+      exponential <-
+        meterCreateHistogram
+          m
+          "retained.exponential"
+          Nothing
+          Nothing
+          defaultAdvisoryParameters {advisoryHistogramAggregation = Just (HistogramAggregationExponential 3)}
+      entered <- newEmptyMVar
+      resume <- newEmptyMVar
+      secondStarted <- newEmptyMVar
+      calls <- newIORef (0 :: Int)
+      create
+        m
+        [ \result -> do
+            call <- atomicModifyIORef' calls (\n -> (n + 1, n + 1))
+            counterAdd intCounter 1 emptyAttributes
+            counterAdd doubleCounter 1 emptyAttributes
+            histogramRecord histogram 1 emptyAttributes
+            histogramRecord exponential 1 emptyAttributes
+            observe result (fromIntegral call) (attributes "first")
+            when (call == 1) $ putMVar entered () >> takeMVar resume
+            observe result (fromIntegral call) (attributes "second")
+        ]
+      completed <- timeout 2000000 $
+        withAsync (collectResourceMetrics env) $ \first -> do
+          takeMVar entered
+          withAsync (putMVar secondStarted () >> collectResourceMetrics env) $ \second -> do
+            takeMVar secondStarted
+            timeout 50000 (void $ wait second) `shouldReturn` Nothing
+            putMVar resume ()
+            firstPoints <- gaugePoints <$> wait first
+            secondPoints <- gaugePoints <$> wait second
+            map gaugeDataPointValue firstPoints `shouldMatchList` [number 1, number 1]
+            map gaugeDataPointValue secondPoints `shouldMatchList` [number 2, number 2]
+      completed `shouldBe` Just ()
+
+  it "waits for an active collection before clearing storage at shutdown" $ do
+    exporterStopped <- newEmptyMVar
+    finishShutdown <- newEmptyMVar
+    callbackEntered <- newEmptyMVar
+    finishCollection <- newEmptyMVar
     calls <- newIORef (0 :: Int)
+    let exporter =
+          MetricExporter
+            { metricExporterExport = \_ -> pure Success
+            , metricExporterShutdown = putMVar exporterStopped () >> takeMVar finishShutdown >> pure ShutdownSuccess
+            , metricExporterForceFlush = pure FlushSuccess
+            }
+    (provider, env) <-
+      createMeterProvider
+        emptyMaterializedResources
+        defaultSdkMeterProviderOptions {metricExporter = Just exporter}
+    m <- getMeter provider scope
     create
       m
       [ \result -> do
           call <- atomicModifyIORef' calls (\n -> (n + 1, n + 1))
-          observe result (fromIntegral call) (attributes "first")
-          when (call == 1) $ putMVar entered () >> takeMVar resume
-          observe result (fromIntegral call) (attributes "second")
+          observe result 1 (attributes "first")
+          when (call == 2) $ putMVar callbackEntered () >> takeMVar finishCollection
+          observe result 2 (attributes "second")
       ]
     completed <- timeout 2000000 $
-      withAsync (collectResourceMetrics env) $ \first -> do
-        takeMVar entered
-        withAsync (putMVar secondStarted () >> collectResourceMetrics env) $ \second -> do
-          takeMVar secondStarted
-          timeout 50000 (void $ wait second) `shouldReturn` Nothing
-          putMVar resume ()
-          firstPoints <- gaugePoints <$> wait first
-          secondPoints <- gaugePoints <$> wait second
-          map gaugeDataPointValue firstPoints `shouldMatchList` [number 1, number 1]
-          map gaugeDataPointValue secondPoints `shouldMatchList` [number 2, number 2]
+      withAsync (shutdownMeterProvider provider Nothing) $ \shutdown -> do
+        takeMVar exporterStopped
+        withAsync (collectResourceMetrics env) $ \collection -> do
+          takeMVar callbackEntered
+          putMVar finishShutdown ()
+          timeout 50000 (void $ wait shutdown) `shouldReturn` Nothing
+          putMVar finishCollection ()
+          points <- gaugePoints <$> wait collection
+          map gaugeDataPointValue points `shouldMatchList` [number 1, number 2]
+          wait shutdown `shouldReturn` ShutdownSuccess
+          gaugePoints <$> collectResourceMetrics env `shouldReturn` []
     completed `shouldBe` Just ()
 
   forM_ [False, True] $ \flush ->
