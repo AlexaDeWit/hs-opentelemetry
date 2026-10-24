@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Store metric aggregates in an MVar and evaluate each update while holding it.
+  Concurrent recorders wait for the lock instead of evaluating shared update thunks.
+  The exported SdkMeterEnv.sdkMeterStorage field changes from IORef to MVar.
+
 ## 1.0.0.0 - 2026-05-29
 
 ### Spec conformance (1.55.0 audit)

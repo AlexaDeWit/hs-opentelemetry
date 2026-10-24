@@ -124,6 +124,7 @@ module OpenTelemetry.Metric (
   Attribute (..),
 ) where
 
+import Control.Concurrent.MVar (newMVar)
 import Control.Exception (bracket)
 import Control.Monad (void)
 import Data.IORef (newIORef)
@@ -170,7 +171,7 @@ fields are properly allocated (not bottom) so shutdown and flush never crash.
 -}
 noopSdkMeterEnv :: IO SdkMeterEnv
 noopSdkMeterEnv = do
-  storageRef <- newIORef emptyStorageState
+  storageRef <- newMVar emptyStorageState
   cbRef <- newIORef Seq.empty
   sdRef <- newIORef True
   pure
