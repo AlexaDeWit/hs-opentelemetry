@@ -98,6 +98,7 @@ import Data.Word (Word64)
 import OpenTelemetry.Baggage (Baggage)
 import OpenTelemetry.Context (Context, empty, insertBaggage, lookupBaggage, removeBaggage)
 import OpenTelemetry.Internal.Logging (otelLogError)
+import OpenTelemetry.Util (casReadModifyIORef_)
 import System.IO.Unsafe
 import Prelude hiding (lookup)
 
@@ -146,7 +147,7 @@ tokenCounter = unsafePerformIO (newIORef 0)
 
 
 nextTokenId :: IO Word64
-nextTokenId = atomicModifyIORef' tokenCounter (\n -> let !n' = n + 1 in (n', n'))
+nextTokenId = (+ 1) <$> casReadModifyIORef_ tokenCounter (+ 1)
 {-# INLINE nextTokenId #-}
 
 
