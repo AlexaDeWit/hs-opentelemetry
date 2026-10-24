@@ -2,9 +2,14 @@
 
 module OpenTelemetry.Context.ThreadLocalSpec where
 
+import Control.Concurrent.Async (forConcurrently_)
+import Control.Exception (bracket)
+import Control.Monad (replicateM_)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isNothing)
 import OpenTelemetry.Context (empty, insert, lookup, newKey)
 import OpenTelemetry.Context.ThreadLocal
+import OpenTelemetry.Internal.Logging (getGlobalErrorHandler, setGlobalErrorHandler)
 import Test.Hspec
 import Prelude hiding (lookup)
 
@@ -83,6 +88,32 @@ spec = describe "Context.ThreadLocal" $ do
       -- Out-of-order detach: should log error but still restore
       detachContext tok1
       detachContext tok2 :: IO ()
+
+  describe "concurrent token allocation" $ do
+    it "restores nested contexts on independent threads without token mismatches" $ do
+      errors <- newIORef []
+      key <- newKey "concurrent"
+      bracket getGlobalErrorHandler setGlobalErrorHandler $ \_ -> do
+        setGlobalErrorHandler (\message -> atomicModifyIORef' errors (\xs -> (message : xs, ())))
+        forConcurrently_ [1 .. 8 :: Int] $ \worker ->
+          replicateM_ 1000 $
+            bracket (attachContext (insert key worker empty)) detachContext $ \_ -> do
+              bracket (attachContext (insert key (-worker) empty)) detachContext $ \_ ->
+                (lookup key <$> getContext) `shouldReturn` Just (-worker)
+              (lookup key <$> getContext) `shouldReturn` Just worker
+      readIORef errors `shouldReturn` []
+
+    it "rejects a stale token after another attach" $ do
+      errors <- newIORef []
+      bracket getGlobalErrorHandler setGlobalErrorHandler $ \_ -> do
+        setGlobalErrorHandler (\message -> atomicModifyIORef' errors (\xs -> (message : xs, ())))
+        original <- attachContext empty
+        detachContext original
+        current <- attachContext empty
+        detachContext original
+        detachContext current
+      messages <- readIORef errors
+      length messages `shouldBe` 2
 
   describe "adjustContext" $ do
     it "modifies the current thread context" $ do

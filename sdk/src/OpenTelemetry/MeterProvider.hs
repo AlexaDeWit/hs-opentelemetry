@@ -85,6 +85,7 @@ import OpenTelemetry.Metric.View (View (..), ViewAggregation (..), findMatchingV
 import OpenTelemetry.Resource (MaterializedResources)
 import OpenTelemetry.Trace.Core (SpanContext (..), getSpanContext, isValid)
 import OpenTelemetry.Trace.Id (spanIdBytes, traceIdBytes)
+import OpenTelemetry.Util (casModifyIORef_, casReadModifyIORef_)
 import System.Clock (Clock (Realtime), getTime, toNanoSecs)
 
 
@@ -516,7 +517,7 @@ addSumInt
 addSumInt delta isMonotonic mExVal k ref lim exOpts = do
   mex <- captureMetricExemplar exOpts mExVal
   let cap = exemplarReservoirLimit exOpts
-  atomicModifyIORef' ref $ \st ->
+  casModifyIORef_ ref $ \st ->
     let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
     in let m = storageCells st
            scount = seriesCountByDims st
@@ -542,7 +543,7 @@ addSumInt delta isMonotonic mExVal k ref lim exOpts = do
            isNew = not (H.member effectiveK m)
            m' = H.insert effectiveK newCell m
            sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-       in (SdkMeterStorageState m' sc', ())
+       in SdkMeterStorageState m' sc'
 
 
 addSumDbl
@@ -557,7 +558,7 @@ addSumDbl
 addSumDbl delta isMonotonic mExVal k ref lim exOpts = do
   mex <- captureMetricExemplar exOpts mExVal
   let cap = exemplarReservoirLimit exOpts
-  atomicModifyIORef' ref $ \st ->
+  casModifyIORef_ ref $ \st ->
     let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
     in let m = storageCells st
            scount = seriesCountByDims st
@@ -583,14 +584,14 @@ addSumDbl delta isMonotonic mExVal k ref lim exOpts = do
            isNew = not (H.member effectiveK m)
            m' = H.insert effectiveK newCell m
            sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-       in (SdkMeterStorageState m' sc', ())
+       in SdkMeterStorageState m' sc'
 
 
 addEither :: Either Int64 Double -> Either Int64 Double -> Either Int64 Double
-addEither (Left a) (Left b) = Left (a + b)
-addEither (Left a) (Right b) = Right (fromIntegral a + b)
-addEither (Right a) (Left b) = Right (a + fromIntegral b)
-addEither (Right a) (Right b) = Right (a + b)
+addEither (Left a) (Left b) = Left $! a + b
+addEither (Left a) (Right b) = Right $! fromIntegral a + b
+addEither (Right a) (Left b) = Right $! a + fromIntegral b
+addEither (Right a) (Right b) = Right $! a + b
 
 
 mergeHist :: HistCell -> Double -> HistCell
@@ -623,7 +624,7 @@ recordHist bounds v mExVal k ref lim exOpts = do
     else do
       mex <- captureMetricExemplar exOpts (fmap DoubleNumber mExVal)
       let cap = exemplarReservoirLimit exOpts
-      atomicModifyIORef' ref $ \st ->
+      casModifyIORef_ ref $ \st ->
         let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
         in let m = storageCells st
                scount = seriesCountByDims st
@@ -637,7 +638,7 @@ recordHist bounds v mExVal k ref lim exOpts = do
                isNew = not (H.member effectiveK m)
                m' = H.insert effectiveK newCell m
                sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-           in (SdkMeterStorageState m' sc', ())
+           in SdkMeterStorageState m' sc'
 
 
 recordExpHist
@@ -655,7 +656,7 @@ recordExpHist sc v mExVal k ref lim exOpts = do
     else do
       mex <- captureMetricExemplar exOpts (fmap DoubleNumber mExVal)
       let cap = exemplarReservoirLimit exOpts
-      atomicModifyIORef' ref $ \st ->
+      casModifyIORef_ ref $ \st ->
         let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
         in let m = storageCells st
                scount = seriesCountByDims st
@@ -669,7 +670,7 @@ recordExpHist sc v mExVal k ref lim exOpts = do
                isNew = not (H.member effectiveK m)
                m' = H.insert effectiveK newCell m
                sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-           in (SdkMeterStorageState m' sc', ())
+           in SdkMeterStorageState m' sc'
 
 
 recordGauge
@@ -684,7 +685,7 @@ recordGauge
 recordGauge val t mExVal k ref lim exOpts = do
   mex <- captureMetricExemplar exOpts mExVal
   let cap = exemplarReservoirLimit exOpts
-  atomicModifyIORef' ref $ \st ->
+  casModifyIORef_ ref $ \st ->
     let effectiveK = if canAcceptNewSeries lim k st then k else overflowKey (fst k)
     in let m = storageCells st
            scount = seriesCountByDims st
@@ -716,7 +717,7 @@ recordGauge val t mExVal k ref lim exOpts = do
            isNew = not (H.member effectiveK m)
            m' = H.insert effectiveK newCell m
            sc' = if isNew then bumpSeriesCount (fst effectiveK) scount else scount
-       in (SdkMeterStorageState m' sc', ())
+       in SdkMeterStorageState m' sc'
 
 
 resetCellForDelta :: Cell -> Cell
@@ -1123,7 +1124,7 @@ collectResourceMetrics env = liftIO $ do
   -- record* calls between read and reset cannot be silently dropped.
   st <- case temp of
     AggregationDelta ->
-      atomicModifyIORef' (sdkMeterStorage env) $ \s -> (applyDeltaReset s, s)
+      casReadModifyIORef_ (sdkMeterStorage env) applyDeltaReset
     AggregationCumulative ->
       readIORef (sdkMeterStorage env)
   let rme = buildResourceExport (sdkMeterResource env) startT t temp (storageCells st)

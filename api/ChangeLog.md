@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Allocate context token IDs with strict compare-and-swap. Concurrent attaches
+  no longer publish an unevaluated increment in the shared token counter.
+
 ## 1.0.0.0 - 2026-05-29
 
 ### Full Spec conformance against 1.55.0

@@ -2,6 +2,9 @@
 
 module OpenTelemetry.MeterProviderSpec (spec) where
 
+import Control.Concurrent (newEmptyMVar, readMVar, tryPutMVar, yield)
+import Control.Concurrent.Async (concurrently, forConcurrently_)
+import Control.Monad (replicateM, replicateM_)
 import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Vector as V
@@ -73,6 +76,48 @@ firstMetric _ = error "expected single ResourceMetricsExport"
 spec :: Spec
 spec = do
   describe "OpenTelemetry.MeterProvider" $ do
+    describe "concurrent recording" $ do
+      it "enforces cardinality while new series race" $ do
+        (provider, env) <-
+          createMeterProvider
+            emptyMaterializedResources
+            defaultSdkMeterProviderOptions {cardinalityLimit = 2}
+        meter <- getMeter provider scope
+        counter <- meterCreateCounterInt64 meter "bounded" Nothing Nothing defaultAdvisoryParameters
+        forConcurrently_ [1 .. 16 :: Int] $ \n ->
+          replicateM_ 100 (counterAdd counter 1 (addAttribute defaultAttributeLimits emptyAttributes "worker" n))
+        batches <- collectResourceMetrics env
+        sum (intSums batches) `shouldBe` 1600
+        length (intSums batches) `shouldSatisfy` (<= 3)
+        case firstMetric batches of
+          MetricExportSum {mesSumPoints = points} ->
+            V.any (\point -> lookupAttribute (sumDataPointAttributes point) "otel.metric.overflow" == Just (AttributeValue (BoolAttribute True))) points
+              `shouldBe` True
+          _ -> expectationFailure "expected MetricExportSum"
+
+      it "does not lose records during concurrent delta collection" $ do
+        (provider, env) <-
+          createMeterProvider
+            emptyMaterializedResources
+            defaultSdkMeterProviderOptions {aggregationTemporality = AggregationDelta}
+        meter <- getMeter provider scope
+        counter <- meterCreateCounterInt64 meter "delta.counter" Nothing Nothing defaultAdvisoryParameters
+        histogram <- meterCreateHistogram meter "delta.histogram" Nothing Nothing defaultAdvisoryParameters
+        started <- newEmptyMVar
+        let record = counterAdd counter 1 emptyAttributes >> histogramRecord histogram 2 emptyAttributes
+            workers = forConcurrently_ [1 .. 4 :: Int] $ \_ -> do
+              record
+              _ <- tryPutMVar started ()
+              replicateM_ 1999 record
+        (_, snapshots) <- concurrently workers (readMVar started >> replicateM 100 (yield >> collectResourceMetrics env))
+        final <- collectResourceMetrics env
+        let batches = concat snapshots <> final
+            histogramPoints = [point | MetricExportHistogram {mehPoints = points} <- allMetrics batches, point <- V.toList points]
+        sum (intSums batches) `shouldBe` 8000
+        sum (map histogramDataPointCount histogramPoints) `shouldBe` 8000
+        sum (map histogramDataPointSum histogramPoints) `shouldBe` 16000
+        sum (map (V.sum . histogramDataPointBucketCounts) histogramPoints) `shouldBe` 8000
+
     -- Counter (Int64)
     it "aggregates Int64 counter measurements (cumulative sum)" $ do
       (provider, env) <- createMeterProvider emptyMaterializedResources defaultSdkMeterProviderOptions
@@ -499,3 +544,20 @@ spec = do
       case batches of
         [rme] -> V.null (resourceMetricsScopes rme) `shouldBe` True
         _ -> expectationFailure "expected single ResourceMetricsExport"
+
+
+allMetrics :: [ResourceMetricsExport] -> [MetricExport]
+allMetrics batches =
+  [ metric
+  | resource <- batches
+  , scopeMetrics <- V.toList (resourceMetricsScopes resource)
+  , metric <- V.toList (scopeMetricsExports scopeMetrics)
+  ]
+
+
+intSums :: [ResourceMetricsExport] -> [Int64]
+intSums batches =
+  [ n
+  | MetricExportSum {mesSumPoints = points} <- allMetrics batches
+  , SumDataPoint {sumDataPointValue = IntNumber n} <- V.toList points
+  ]

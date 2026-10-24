@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Evaluate metric storage updates before publishing them with compare-and-swap.
+  Concurrent recorders no longer wait for another recorder to evaluate the
+  shared storage state. Delta collection retains an atomic snapshot and reset.
+
 ## 1.0.0.0 - 2026-05-29
 
 ### Spec conformance (1.55.0 audit)
